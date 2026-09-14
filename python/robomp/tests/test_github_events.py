@@ -74,6 +74,33 @@ def test_route_issue_reopened_queues_triage() -> None:
     assert decision.association == "CONTRIBUTOR"
 
 
+@pytest.mark.parametrize("action", ["opened", "reopened"])
+@pytest.mark.parametrize(
+    "author",
+    [
+        {"login": BOT},
+        {"login": "renovate[bot]"},
+        {"login": "renovate", "type": "Bot"},
+    ],
+)
+def test_route_skips_bot_authored_issue(action: str, author: dict[str, str]) -> None:
+    # An issue from any bot identity must not open a model turn. Reviewer bots
+    # only authorize directive comments/reviews; an issue body is untrusted.
+    decision = route(
+        "issues",
+        {
+            "action": action,
+            "issue": {"number": 4, "user": author},
+            "repository": {"full_name": "octo/widget"},
+        },
+        allowlist=ALLOWLIST,
+        bot_login=BOT,
+    )
+    assert not decision.should_queue
+    assert "bot" in decision.reason
+    assert decision.issue_key == "octo/widget#4"
+
+
 def test_route_skips_disallowed_repo() -> None:
     decision = route(
         "issues",

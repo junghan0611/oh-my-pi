@@ -328,6 +328,14 @@ def route(
             return RouteDecision("skip", None, repo, None, "issue missing number")
         key = issue_key(repo, number)
         if action in ("opened", "reopened"):
+            # Bot-authored issues must not open a model turn, exactly as
+            # bot-authored comments don't in the `issue_comment` branch below.
+            # `reviewer_bots` only authorize directive comments/reviews; their
+            # issue creation remains untrusted input. `issues.closed` is
+            # deliberately left unguarded so our own auto-close can keep
+            # reclaiming the workspace it just finished with.
+            if _is_bot_account(issue.get("user"), bot_login):
+                return RouteDecision("skip", None, repo, key, "bot/self issue")
             # A reopen is submitter-attributable exactly like an open, and
             # `finalized_issue_comment.md` promises re-triage on reopen, so it
             # re-triages from scratch and spends the same per-user rate budget.
