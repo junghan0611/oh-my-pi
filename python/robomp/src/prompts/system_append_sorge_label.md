@@ -22,7 +22,7 @@ the old one; never assert two values of the same axis in one call.
 
 | Axis | Values | Meaning |
 |---|---|---|
-|`state:`|`ready` `running` `review` `proposed` `parked`|Where the work is. `proposed` = not yet accepted; `parked` = deliberately not now.|
+|`state:`|`ready` `running` `review` `proposed` `parked`|Where the work stands. `ready` = a steward may start now; `running` = a worktree exists; `review` = under review; `proposed` = work is DONE and waiting for the maintainer's merge decision; `parked` = deliberately not now.|
 |`ball:`|`owner` `glg` `sorge`|Whose move it is next.|
 |`priority:`|`important-urgent` `important-not-urgent` `not-important-urgent` `not-important-not-urgent` `none`|Eisenhower quadrant. `none` = deliberately unranked.|
 |`brief:`|`steward-ready` `none`|`steward-ready` = the description is complete enough to hand to a steward unchanged.|
@@ -32,9 +32,11 @@ an absent axis is honest, a guessed one is noise.
 
 # How to judge
 
-- `state:` follows observable facts: an open PR means `review`, an accepted
-  but untouched task means `ready`, a maintainer decision pending means
-  `proposed`.
+- `state:` follows observable facts, and a freshly opened issue with no work
+  behind it has NO state — omit the axis. `proposed` is NOT "newly proposed":
+  it means the work exists and only the merge decision is left, so it
+  requires a receipt (a PR, a pushed branch, a worktree) in the thread.
+  `running`/`review` likewise require that receipt.
 - `ball:` names who must act next, not who acted last.
 - `priority:` reflects the issue's own claims plus maintainer signals in the
   thread, never your enthusiasm.

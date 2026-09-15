@@ -250,6 +250,45 @@ def _build_extra_env(settings: Settings) -> dict[str, str]:
     return env
 
 
+def _link_host_credentials(settings: Settings, rpc_env: dict[str, str]) -> None:
+    """Make the host credential store reachable from the child's XDG home.
+
+    `PI_CODING_AGENT_DIR` alone is not enough: measured 2026-09-15, once
+    `XDG_DATA_HOME` is set the child resolves `agent.db` from
+    `$XDG_DATA_HOME/omp/agent.db` and ignores the agent-dir override for the
+    credential store, so a slot-isolated turn comes up with no provider
+    credentials at all ("No API key found for <provider>"). Symlinking just
+    that one file keeps the isolation (sessions, blobs, caches stay
+    per-workspace) while the child authenticates as the operator.
+
+    No-ops when `agent_dir` is unset, when the child has no XDG isolation
+    (the env override then works on its own), or when something real already
+    sits at the target — clobbering a slot's own store would lose its state.
+    """
+    if settings.agent_dir is None:
+        return
+    data_home = rpc_env.get("XDG_DATA_HOME")
+    if not data_home:
+        return
+    source = settings.agent_dir / "agent.db"
+    if not source.is_file():
+        log.warning(
+            "agent_dir has no agent.db; child will have no credentials",
+            extra={"agent_dir": str(settings.agent_dir)},
+        )
+        return
+    link = Path(data_home) / "omp" / "agent.db"
+    if link.is_symlink():
+        if os.readlink(link) == str(source):
+            return
+        link.unlink()
+    elif link.exists():
+        log.warning("refusing to replace a real agent.db", extra={"path": str(link)})
+        return
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(source)
+
+
 _TERMINAL_TRIAGE_TOOLS: frozenset[str] = frozenset({"gh_open_pr", "mark_unable_to_reproduce", "abort_task"})
 _TERMINAL_REVIEW_TOOLS: frozenset[str] = frozenset({"submit_pr_review", "abort_task"})
 _TERMINAL_RELEASE_TOOLS: frozenset[str] = frozenset({"release_retag", "abort_task"})
@@ -615,6 +654,7 @@ def _run_rpc_blocking(
     rpc_env.update(_prepare_slot_runtime_env(inputs.workspace, inputs.slot_uid))
     rpc_env.update(_safe_directory_env(bindings.workspace.repo_dir))
     rpc_env.update(_git_identity_env(inputs.settings.resolved_author_name, inputs.settings.git_author_email))
+    _link_host_credentials(settings, rpc_env)
     # Bare worktrees have no node_modules; install (idempotently) so the agent
     # can resolve workspace packages (@oh-my-pi/pi-*) and actually run tests.
     host_tools.ensure_workspace_dependencies(bindings)

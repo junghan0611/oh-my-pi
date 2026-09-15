@@ -389,7 +389,14 @@ class WorkerPool:
                 "recovered": row.attempts >= 2,
             },
         )
-        if event == "issues" and action in ("opened", "reopened"):
+        # The label-only profile also wakes on `edited`/`labeled` (someone
+        # changed the facts a verdict was read from), and `route` already
+        # cleared those. Without them here the wake is claimed and then
+        # silently dropped as a no-op dispatch.
+        triage_actions = (
+            ("opened", "reopened", "edited", "labeled") if self.settings.sorge_label_only else ("opened", "reopened")
+        )
+        if event == "issues" and action in triage_actions:
             await tasks.triage_issue(
                 settings=self.settings,
                 db=self.db,

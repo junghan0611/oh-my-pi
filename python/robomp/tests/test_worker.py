@@ -1256,3 +1256,49 @@ def test_child_process_gets_no_agent_dir_by_default(
 ) -> None:
     monkeypatch.setattr(worker, "_AGENT_HOME", tmp_path / "missing-agent-home")
     assert "PI_CODING_AGENT_DIR" not in worker._build_extra_env(settings)
+
+
+def test_host_credentials_are_linked_into_the_child_xdg_home(tmp_path: Path, settings: Settings) -> None:
+    # `PI_CODING_AGENT_DIR` is ignored for the credential store once the slot
+    # has its own XDG_DATA_HOME, so the store has to be reachable at
+    # `$XDG_DATA_HOME/omp/agent.db` or the turn dies with "No API key found".
+    host = tmp_path / "host-agent"
+    host.mkdir()
+    (host / "agent.db").write_bytes(b"sqlite")
+    data_home = tmp_path / "ws" / ".omp-xdg" / "data"
+    cfg = settings.model_copy(update={"agent_dir": host})
+    env = {"XDG_DATA_HOME": str(data_home)}
+
+    worker._link_host_credentials(cfg, env)
+
+    link = data_home / "omp" / "agent.db"
+    assert link.is_symlink()
+    assert link.resolve() == (host / "agent.db").resolve()
+    # Idempotent: a second turn on the same workspace must not fail or relink.
+    worker._link_host_credentials(cfg, env)
+    assert link.resolve() == (host / "agent.db").resolve()
+
+
+def test_a_slots_own_credential_store_is_never_clobbered(tmp_path: Path, settings: Settings) -> None:
+    host = tmp_path / "host-agent"
+    host.mkdir()
+    (host / "agent.db").write_bytes(b"host")
+    data_home = tmp_path / "ws" / ".omp-xdg" / "data"
+    (data_home / "omp").mkdir(parents=True)
+    own = data_home / "omp" / "agent.db"
+    own.write_bytes(b"slot-own")
+
+    worker._link_host_credentials(settings.model_copy(update={"agent_dir": host}), {"XDG_DATA_HOME": str(data_home)})
+
+    assert not own.is_symlink()
+    assert own.read_bytes() == b"slot-own"
+
+
+def test_no_xdg_isolation_leaves_the_env_override_alone(tmp_path: Path, settings: Settings) -> None:
+    host = tmp_path / "host-agent"
+    host.mkdir()
+    (host / "agent.db").write_bytes(b"host")
+
+    worker._link_host_credentials(settings.model_copy(update={"agent_dir": host}), {})
+
+    assert not (tmp_path / "omp").exists()
