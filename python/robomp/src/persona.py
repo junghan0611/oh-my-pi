@@ -145,6 +145,29 @@ def system_append_pr_review(*, repo: RepoInfo, issue: IssueInfo, workspace: Work
     )
 
 
+def system_append_sorge_label(*, repo: RepoInfo, issue: IssueInfo, workspace: Workspace, bot_login: str) -> str:
+    """Invariant instructions for a label-only judgement turn.
+
+    Replaces `system_append` (not appended to it): that prompt mandates
+    classify → comment → reproduce → PR, none of which exists in this
+    profile's toolset.
+    """
+    return render(
+        _load("system_append_sorge_label.md"),
+        {"repo": repo, "issue": issue, "workspace": workspace, "bot_login": bot_login},
+    )
+
+
+def sorge_label_triage(*, repo: RepoInfo, issue: IssueInfo, workspace: Workspace) -> str:
+    """The one-shot label judgement prompt for a single issue."""
+    return render(_load("sorge_label_triage.md"), {"repo": repo, "issue": issue, "workspace": workspace})
+
+
+def sorge_label_reminder(*, repo: RepoInfo, issue: IssueInfo, workspace: Workspace) -> str:
+    """Reminder injected when a label-only turn ended without a verdict."""
+    return render(_load("sorge_label_reminder.md"), {"repo": repo, "issue": issue, "workspace": workspace})
+
+
 def system_append_release(
     *,
     repo: RepoInfo,
@@ -445,6 +468,9 @@ __all__ = [
     "resume_triage",
     "seed_phases",
     "system_append",
+    "system_append_sorge_label",
+    "sorge_label_triage",
+    "sorge_label_reminder",
     "unable_to_reproduce_comment",
     "bare_mention_reply",
     "question_autoclose_suffix",

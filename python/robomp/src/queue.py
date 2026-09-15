@@ -214,11 +214,18 @@ class WorkerPool:
             log.exception("dispatch loop crashed")
 
     async def _claim_next_unique(self) -> EventRow | None:
-        """Claim the next event whose issue isn't already inflight."""
+        """Claim the next event whose issue isn't already inflight.
+
+        Under the label-only profile the claim also collapses a per-issue
+        backlog to its newest delivery — see `Database.claim_next_event`.
+        """
         # The DB layer doesn't filter by issue_key; we peek then guard with a set.
         async with self._inflight_lock:
             # Naive but fine for v1 (small queue).
-            row = await asyncio.to_thread(self.db.claim_next_event)
+            row = await asyncio.to_thread(
+                self.db.claim_next_event,
+                coalesce_issue_events=self.settings.sorge_label_only,
+            )
             if row is None:
                 return None
             key = row.issue_key or row.delivery_id

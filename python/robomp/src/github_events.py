@@ -70,6 +70,37 @@ def _login_matches_bot(login: str | None, bot_login: str) -> bool:
     return bool(normalized_login) and normalized_login == _normalize_bot_login(bot_login)
 
 
+def _sender_login(payload: Mapping[str, Any]) -> str:
+    """Normalized `sender.login` — the account that caused this delivery."""
+    sender = payload.get("sender")
+    if not isinstance(sender, Mapping):
+        return ""
+    return _normalize_bot_login(sender.get("login"))
+
+
+def _issue_key_of(payload: Mapping[str, Any], repo: str) -> str | None:
+    """Issue key carried by this payload, for skip-decision bookkeeping."""
+    issue = payload.get("issue")
+    if not isinstance(issue, Mapping):
+        return None
+    number = issue.get("number")
+    return issue_key(repo, number) if isinstance(number, int) else None
+
+
+def _sender_is_self(payload: Mapping[str, Any], self_logins: frozenset[str], bot_login: str) -> bool:
+    """Whether this delivery was caused by the deployment itself.
+
+    Distinct from `_is_bot_account`, which asks who *authored* an issue or
+    comment. Here we ask who *acted*: a label the bot applied arrives as a
+    third party's issue with `sender` = the bot, and re-waking on it is how a
+    label-only profile would loop on itself forever.
+    """
+    login = _sender_login(payload)
+    if not login:
+        return False
+    return login == _normalize_bot_login(bot_login) or login in self_logins
+
+
 def _login_matches_personal_repo_owner(
     login: str | None,
     repository: Mapping[str, Any] | None,
@@ -228,6 +259,8 @@ def route(
     pr_review_enabled: bool = True,
     release_sentinel_enabled: bool = False,
     release_commit_prefix: str = "chore: bump version to ",
+    task_profile: str = "full",
+    self_logins: frozenset[str] = frozenset(),
 ) -> RouteDecision:
     """Decide whether and how to handle a webhook event.
 
@@ -236,12 +269,39 @@ def route(
     that key so follow-ups serialize with the original issue. If the mapping
     is missing, the event is still actionable and falls back to the PR's own
     issue key (`octo/widget#1080`).
+
+    `task_profile == "sorge-label"` narrows the router to the label-judgement
+    deployment: issue label/edit events also wake a turn, self-caused
+    deliveries never do, and every event that would open a non-triage model
+    turn (comments, PR review, release CI) is dropped — that profile's
+    toolset cannot comment, push, or open a PR, so queueing those turns would
+    only burn a model call. Workspace cleanup is untouched: it opens no turn.
     """
     repo = _repo_full_name(payload)
     if repo is None or repo.lower() not in allowlist:
         return RouteDecision("skip", None, repo, None, "repo not on allowlist")
 
     action = str(payload.get("action") or "")
+    label_only = task_profile == "sorge-label"
+
+    if label_only:
+        # `issues.closed` is exempt from the self-guard for the same reason
+        # the stock router leaves it unguarded: our own close must still
+        # reclaim the workspace it just finished with, and cleanup is not a
+        # model turn.
+        lifecycle_cleanup = action == "closed" and event_type in ("issues", "pull_request")
+        if not lifecycle_cleanup and _sender_is_self(payload, self_logins, bot_login):
+            return RouteDecision(
+                "skip", None, repo, _issue_key_of(payload, repo), f"{event_type}.{action} caused by self"
+            )
+        if not lifecycle_cleanup and event_type != "issues":
+            return RouteDecision(
+                "skip",
+                None,
+                repo,
+                _issue_key_of(payload, repo),
+                f"{event_type}.{action} not handled in label-only profile",
+            )
 
     if event_type == "workflow_run":
         if action != "completed":
@@ -327,7 +387,11 @@ def route(
         if not isinstance(number, int):
             return RouteDecision("skip", None, repo, None, "issue missing number")
         key = issue_key(repo, number)
-        if action in ("opened", "reopened"):
+        # The label-only profile re-judges on every mutation of the issue
+        # itself: a maintainer editing the body or hand-setting an axis label
+        # is exactly the signal that the previous verdict is stale. Self-caused
+        # deliveries were already dropped above, so this cannot self-trigger.
+        if action in ("opened", "reopened") or (label_only and action in ("edited", "labeled")):
             # Bot-authored issues must not open a model turn, exactly as
             # bot-authored comments don't in the `issue_comment` branch below.
             # `reviewer_bots` only authorize directive comments/reviews; their

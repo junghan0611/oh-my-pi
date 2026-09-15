@@ -12,6 +12,10 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 ThinkingLevel = Literal["off", "low", "medium", "high", "xhigh", "max"]
 
+# `full` is the stock upstream behavior. `sorge-label` is the narrow
+# label-judgement profile documented on `Settings.task_profile`.
+TaskProfile = Literal["full", "sorge-label"]
+
 
 class Settings(BaseSettings):
     """Strongly-typed runtime configuration.
@@ -38,6 +42,37 @@ class Settings(BaseSettings):
     git_author_email: str = Field(..., alias="ROBOMP_GIT_AUTHOR_EMAIL")
     repo_allowlist_raw: str = Field("", alias="ROBOMP_REPO_ALLOWLIST")
     pr_review_enabled: bool = Field(True, alias="ROBOMP_PR_REVIEW_ENABLED")
+
+    # Task profile — the single switch between the stock bot and the narrow
+    # label-judgement deployment.
+    #
+    # `full` (default): unchanged upstream behavior. An issue turn triages,
+    # comments, reproduces, pushes, and opens PRs.
+    #
+    # `sorge-label`: every model turn is one label judgement and nothing
+    # else. It additionally wakes on `issues.edited`/`issues.labeled`, drops
+    # every event that is not an issue event, starts a FRESH omp session per
+    # event (never `--continue`), collapses a backlog of queued events for
+    # one issue to its newest delivery, and exposes ONLY the label/read/abort
+    # host tools — no comment, push, PR, close, or classify tool exists in
+    # that turn. An unknown value fails at startup instead of silently
+    # degrading to one of the two.
+    task_profile: TaskProfile = Field("full", alias="ROBOMP_TASK_PROFILE")
+
+    # Logins (comma-separated, `@` prefix optional, case-insensitive) that
+    # this deployment acts as. Under `sorge-label` an event whose
+    # `sender.login` matches one of them never opens a model turn, so a label
+    # the bot itself just applied cannot wake it again. Required whenever the
+    # PAT belongs to a human account rather than a dedicated bot account —
+    # `bot_login` alone then does not cover the acting login.
+    self_logins_raw: str = Field("", alias="ROBOMP_SELF_LOGINS")
+
+    # Absolute path to a host omp agent directory (the one holding
+    # `agent.db`), handed to the child omp process as `PI_CODING_AGENT_DIR`.
+    # Set it to share the host's provider credentials with children that
+    # otherwise run under an isolated per-workspace XDG home and would have
+    # none. Unset: children keep their isolated agent dir.
+    agent_dir: Path | None = Field(None, alias="ROBOMP_AGENT_DIR")
 
     # Release sentinel
     release_sentinel_enabled: bool = Field(False, alias="ROBOMP_RELEASE_SENTINEL_ENABLED")
@@ -180,6 +215,35 @@ class Settings(BaseSettings):
             raise ValueError("ROBOMP_BOT_LOGIN must be a non-empty GitHub login")
         return cleaned
 
+    @field_validator("task_profile", mode="before")
+    @classmethod
+    def _coerce_task_profile(cls, value: object) -> object:
+        """Tolerate padding/case from env files; blank means the default.
+
+        Anything else is left alone so the `TaskProfile` literal rejects it
+        with the list of accepted values at startup.
+        """
+        if isinstance(value, str):
+            return value.strip().lower() or "full"
+        return value
+
+    @field_validator("agent_dir", mode="before")
+    @classmethod
+    def _blank_agent_dir_disables(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
+    @field_validator("agent_dir", mode="after")
+    @classmethod
+    def _require_absolute_agent_dir(cls, value: Path | None) -> Path | None:
+        # The child omp resolves this from its own cwd (a per-issue worktree),
+        # so a relative path would silently point at a non-existent agent dir
+        # and the child would come up with no credentials at all.
+        if value is not None and not value.is_absolute():
+            raise ValueError("ROBOMP_AGENT_DIR must be an absolute path")
+        return value
+
     @field_validator("replay_token", mode="before")
     @classmethod
     def _blank_replay_disables(cls, value: object) -> object:
@@ -319,6 +383,28 @@ class Settings(BaseSettings):
             piece.strip().lstrip("@").lower().removesuffix("[bot]") for piece in self.maintainer_logins_raw.split(",")
         ]
         return frozenset(item for item in items if item)
+
+    @field_validator("self_logins_raw", mode="before")
+    @classmethod
+    def _coerce_self_logins(cls, v: object) -> str:
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        if isinstance(v, (list, tuple)):
+            return ",".join(str(item) for item in v)
+        return str(v)
+
+    @property
+    def self_logins(self) -> frozenset[str]:
+        """Normalized logins this deployment acts as (never wake a turn)."""
+        items = [piece.strip().lstrip("@").lower().removesuffix("[bot]") for piece in self.self_logins_raw.split(",")]
+        return frozenset(item for item in items if item)
+
+    @property
+    def sorge_label_only(self) -> bool:
+        """True while `ROBOMP_TASK_PROFILE=sorge-label` narrows turns to labels."""
+        return self.task_profile == "sorge-label"
 
     def allows(self, full_name: str) -> bool:
         return full_name.lower() in self.repo_allowlist

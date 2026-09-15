@@ -2355,8 +2355,52 @@ def _build_submit_pr_review(bindings: ToolBindings) -> HostTool[Any, Any]:
     )
 
 
+_SORGE_SINGLE_VALUE_AXES: tuple[str, ...] = ("state:", "ball:", "priority:", "brief:")
+"""Sorge label axes that hold exactly one value at a time.
+
+`house:` is deliberately absent: an issue may belong to several houses.
+"""
+
+
+def _prune_superseded_axis_labels(
+    bindings: ToolBindings,
+    number: int,
+    *,
+    requested: list[str],
+    current: tuple[str, ...],
+) -> tuple[str, ...]:
+    """Drop the previous value of every single-value axis just re-assigned.
+
+    GitHub's label endpoint is additive, so a second verdict on the `state:`
+    axis would leave the issue carrying both the old and the new value and
+    the axis would stop meaning anything. Pruning runs AFTER the add, so a
+    failure here degrades to "both values present" rather than "none".
+    """
+    axes = {axis for axis in _SORGE_SINGLE_VALUE_AXES if any(label.startswith(axis) for label in requested)}
+    if not axes:
+        return current
+    keep = set(requested)
+    stale = [label for label in current if label not in keep and label.startswith(tuple(axes))]
+    removed: list[str] = []
+    for label in stale:
+        try:
+            _run_coro(bindings.loop, bindings.github.remove_issue_label(bindings.repo.full_name, number, label))
+        except GitHubError as exc:
+            log.warning(
+                "axis label prune failed",
+                extra={"issue": bindings.issue_key, "label": label, "err": str(exc)},
+            )
+        else:
+            removed.append(label)
+    return tuple(label for label in current if label not in removed)
+
+
 def _build_set_issue_labels(bindings: ToolBindings) -> HostTool[Any, Any]:
-    """Append labels to the originating issue (or PR)."""
+    """Append labels to the originating issue (or PR).
+
+    Under the label-only profile the single-value sorge axes additionally
+    become exclusive — see `_prune_superseded_axis_labels`.
+    """
 
     def execute(args: dict[str, Any], _ctx: HostToolContext[Any]) -> str:
         if bindings.inbound_is_pr:
@@ -2382,6 +2426,8 @@ def _build_set_issue_labels(bindings: ToolBindings) -> HostTool[Any, Any]:
         except GitHubError as exc:
             _audit(bindings, "set_issue_labels", args, error=str(exc))
             _raise_command(f"GitHub rejected labels: {exc.status} {exc.message}")
+        if bindings.settings is not None and bindings.settings.sorge_label_only:
+            applied = _prune_superseded_axis_labels(bindings, target_number, requested=cleaned, current=tuple(applied))
         _audit(bindings, "set_issue_labels", args, result={"labels": list(applied)})
         return f"labels now: {', '.join(applied)}"
 
@@ -2577,15 +2623,30 @@ def _build_classify_issue(bindings: ToolBindings) -> HostTool[Any, Any]:
 
 
 def build(bindings: ToolBindings) -> tuple[HostTool[Any, Any], ...]:
-    """Return the full set of host tools bound to one task's context.
+    """Return the host tools bound to one task's context.
 
-    The toolset is intentionally identical across all task kinds so the LLM
-    prompt cache stays warm across triage → follow-up → PR-conversation
-    transitions. Triage tools (`classify_issue`, `set_issue_labels`) enforce
-    their own scope at execution time — see the `inbound_is_pr` and
-    already-classified guards inside `_build_classify_issue` /
-    `_build_set_issue_labels`.
+    Two shapes exist, selected by `settings.task_profile` — never by task
+    kind:
+
+    - `full` returns everything. The toolset is intentionally identical
+      across all task kinds so the LLM prompt cache stays warm across
+      triage → follow-up → PR-conversation transitions. Triage tools
+      (`classify_issue`, `set_issue_labels`) enforce their own scope at
+      execution time — see the `inbound_is_pr` and already-classified guards
+      inside `_build_classify_issue` / `_build_set_issue_labels`.
+    - `sorge-label` returns the label-judgement subset: read the thread,
+      search prior issues, record a verdict, or decline. Everything that
+      mutates GitHub beyond labels (comment, push, PR, review, release) is
+      ABSENT rather than refusing at execution time, so the model never
+      spends a call discovering it may not act.
     """
+    if bindings.settings is not None and bindings.settings.sorge_label_only:
+        return (
+            _build_set_issue_labels(bindings),
+            _build_fetch_thread(bindings),
+            _build_search_issues(bindings),
+            _build_abort_task(bindings),
+        )
     return (
         _build_classify_issue(bindings),
         _build_set_issue_labels(bindings),

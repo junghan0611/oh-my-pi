@@ -1099,3 +1099,160 @@ async def test_release_task_reminds_until_terminal_tool_runs(
     assert fake.kwargs["append_system_prompt"] == "SYS RELEASE"
     assert fake.kwargs["model"] in settings.release_model_pool
     assert fake.prompts == ["kickoff", *(["retag or abort"] * settings.task_completion_max_reminders)]
+
+
+# ---------------------------------------------------------------------------
+# sorge-label profile
+# ---------------------------------------------------------------------------
+
+
+def _label_only(settings: Settings) -> Settings:
+    return settings.model_copy(update={"task_profile": "sorge-label"})
+
+
+def _run_with_tool_after_first_reminder(
+    inputs: worker.TaskInputs,
+    bindings: SimpleNamespace,
+    *,
+    tool_name: str,
+) -> _FakeRpcClient:
+    """Drive a turn where the agent calls `tool_name` during reminder #1."""
+
+    def _on_prompt(client: _FakeRpcClient, _prompt: str) -> None:
+        if len(client.prompts) == 2:
+            for cb in getattr(client, "_tool_end_callbacks", []):
+                cb(SimpleNamespace(tool_name=tool_name, result={}, is_error=None))
+
+    original_on_tool_end = _FakeRpcClient.on_tool_execution_end
+
+    def _record_tool_end(self, cb) -> None:
+        self._tool_end_callbacks = getattr(self, "_tool_end_callbacks", [])
+        self._tool_end_callbacks.append(cb)
+
+    _FakeRpcClient.on_tool_execution_end = _record_tool_end  # type: ignore[assignment]
+    try:
+        _FakeRpcClient.on_prompt = staticmethod(_on_prompt)  # type: ignore[attr-defined]
+        loop = asyncio.new_event_loop()
+        try:
+            worker._run_rpc_blocking(
+                inputs,
+                task_kind="triage_issue",
+                prompt="kickoff",
+                loop=loop,
+                bindings=bindings,  # type: ignore[arg-type]
+            )
+        finally:
+            loop.close()
+    finally:
+        _FakeRpcClient.on_tool_execution_end = original_on_tool_end  # type: ignore[assignment]
+        delattr(_FakeRpcClient, "on_prompt")
+    return _FakeRpcClient.instances[0]
+
+
+@pytest.mark.asyncio
+async def test_label_only_turn_starts_fresh_despite_a_prior_transcript(tmp_path: Path, settings: Settings) -> None:
+    """Each verdict is judged from the issue as it stands, not from last time."""
+    inputs, bindings = _make_inputs(tmp_path, _label_only(settings), session_has_jsonl=True)
+    loop = asyncio.new_event_loop()
+    try:
+        worker._run_rpc_blocking(
+            inputs,
+            task_kind="triage_issue",
+            prompt="kickoff",
+            loop=loop,
+            bindings=bindings,  # type: ignore[arg-type]
+        )
+    finally:
+        loop.close()
+    fake = _FakeRpcClient.instances[0]
+    assert fake.kwargs["extra_args"] == ()
+    # The transcript stays on disk: only the resume flag is dropped.
+    assert list(inputs.workspace.session_dir.glob("*.jsonl"))
+    # Stock triage phases (Reproduce / Fix / PR) describe work this turn must
+    # not do, so nothing is seeded.
+    assert fake.set_todos_calls == []
+
+
+@pytest.mark.asyncio
+async def test_label_only_turn_reminds_until_a_verdict_lands(tmp_path: Path, settings: Settings) -> None:
+    """No classification gate: any turn that records no label gets nudged."""
+    inputs, bindings = _make_inputs_with_classification(tmp_path, _label_only(settings), classification=None)
+    loop = asyncio.new_event_loop()
+    try:
+        worker._run_rpc_blocking(
+            inputs,
+            task_kind="triage_issue",
+            prompt="kickoff",
+            loop=loop,
+            bindings=bindings,  # type: ignore[arg-type]
+        )
+    finally:
+        loop.close()
+    fake = _FakeRpcClient.instances[0]
+    assert len(fake.prompts) == 1 + settings.task_completion_max_reminders
+
+
+@pytest.mark.asyncio
+async def test_unclassified_full_profile_turn_is_not_reminded(tmp_path: Path, settings: Settings) -> None:
+    """Regression witness for the pair above: `full` still gates on class."""
+    inputs, bindings = _make_inputs_with_classification(tmp_path, settings, classification=None)
+    loop = asyncio.new_event_loop()
+    try:
+        worker._run_rpc_blocking(
+            inputs,
+            task_kind="triage_issue",
+            prompt="kickoff",
+            loop=loop,
+            bindings=bindings,  # type: ignore[arg-type]
+        )
+    finally:
+        loop.close()
+    assert len(_FakeRpcClient.instances[0].prompts) == 1
+
+
+@pytest.mark.asyncio
+async def test_label_only_turn_is_complete_once_labels_are_recorded(tmp_path: Path, settings: Settings) -> None:
+    inputs, bindings = _make_inputs_with_classification(tmp_path, _label_only(settings), classification=None)
+    fake = _run_with_tool_after_first_reminder(inputs, bindings, tool_name="set_issue_labels")
+    assert len(fake.prompts) == 2, fake.prompts
+
+
+@pytest.mark.asyncio
+async def test_label_only_turn_is_not_completed_by_opening_a_pr(tmp_path: Path, settings: Settings) -> None:
+    """`gh_open_pr` is not this profile's terminal action (it isn't even bound)."""
+    inputs, bindings = _make_inputs_with_classification(tmp_path, _label_only(settings), classification=None)
+    fake = _run_with_tool_after_first_reminder(inputs, bindings, tool_name="gh_open_pr")
+    assert len(fake.prompts) == 1 + settings.task_completion_max_reminders
+
+
+def test_label_only_prompt_asks_for_a_verdict_not_a_pr(tmp_path: Path, settings: Settings) -> None:
+    label_inputs, _ = _make_inputs(tmp_path, _label_only(settings), session_has_jsonl=True)
+    full_root = tmp_path / "full"
+    full_root.mkdir()
+    full_inputs, _ = _make_inputs(full_root, settings, session_has_jsonl=False)
+    kwargs = {"comment": None, "pr_number": None, "review_payload": None}
+
+    label_prompt = worker._build_prompt("triage_issue", label_inputs, **kwargs)
+    full_prompt = worker._build_prompt("triage_issue", full_inputs, **kwargs)
+
+    assert "set_issue_labels" in label_prompt
+    assert "classify_issue" not in label_prompt
+    assert "{{" not in label_prompt, "template placeholder leaked"
+    # A prior transcript must not turn it into a resume prompt either.
+    assert label_prompt == worker._build_prompt("triage_issue", label_inputs, resuming=True, **kwargs)
+    assert "classify_issue" in full_prompt
+
+
+def test_agent_dir_is_shared_with_the_child_process(
+    tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worker, "_AGENT_HOME", tmp_path / "missing-agent-home")
+    cfg = settings.model_copy(update={"agent_dir": tmp_path / "host-agent"})
+    assert worker._build_extra_env(cfg)["PI_CODING_AGENT_DIR"] == str(tmp_path / "host-agent")
+
+
+def test_child_process_gets_no_agent_dir_by_default(
+    tmp_path: Path, settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(worker, "_AGENT_HOME", tmp_path / "missing-agent-home")
+    assert "PI_CODING_AGENT_DIR" not in worker._build_extra_env(settings)

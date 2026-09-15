@@ -406,8 +406,17 @@ class Database:
             )
             return cur.rowcount > 0
 
-    def claim_next_event(self) -> EventRow | None:
-        """Atomically dequeue one unblocked queued event into running state."""
+    def claim_next_event(self, *, coalesce_issue_events: bool = False) -> EventRow | None:
+        """Atomically dequeue one unblocked queued event into running state.
+
+        With `coalesce_issue_events`, a queued backlog for the SAME issue
+        collapses to its newest delivery before anything runs: the older rows
+        are terminated as `skipped` (reason: superseded) and never execute.
+        That is what a label-only turn wants — three label edits in a row are
+        one judgement about the issue's current state, not three — while the
+        default (False) keeps the stock per-delivery semantics where every
+        event is a distinct user request that must be answered.
+        """
         with self._txn() as conn:
             now = _utcnow()
             row = conn.execute(
@@ -434,6 +443,8 @@ class Database:
             ).fetchone()
             if row is None:
                 return None
+            if coalesce_issue_events and row["issue_key"] is not None:
+                row = self._coalesce_issue_backlog(conn, row, now=now)
             conn.execute(
                 "UPDATE events SET state='running', attempts=attempts+1, started_at=? WHERE delivery_id=?",
                 (now, row["delivery_id"]),
@@ -449,6 +460,46 @@ class Database:
                 attempts=int(row["attempts"]) + 1,
                 last_error=row["last_error"],
             )
+
+    def _coalesce_issue_backlog(self, conn: sqlite3.Connection, row: sqlite3.Row, *, now: str) -> sqlite3.Row:
+        """Collapse this issue's claimable queue to its newest delivery.
+
+        Runs inside the caller's `BEGIN IMMEDIATE` claim transaction, so the
+        supersede and the claim land together — no window where a superseded
+        row could be claimed by anyone. Rows whose retry backoff has not
+        elapsed are left alone: they are not claimable yet, so they are not
+        part of this claim's backlog.
+        """
+        issue = row["issue_key"]
+        newest = conn.execute(
+            """
+            SELECT delivery_id, event_type, repo, issue_key, payload_json,
+                   received_at, state, attempts, last_error
+            FROM events
+            WHERE state = 'queued' AND issue_key = ?
+              AND (available_at IS NULL OR available_at <= ?)
+            ORDER BY received_at DESC, rowid DESC
+            LIMIT 1
+            """,
+            (issue, now),
+        ).fetchone()
+        if newest is None or newest["delivery_id"] == row["delivery_id"]:
+            return row
+        conn.execute(
+            """
+            UPDATE events SET state='skipped', last_error=?, finished_at=?
+            WHERE state='queued' AND issue_key=? AND delivery_id<>?
+              AND (available_at IS NULL OR available_at <= ?)
+            """,
+            (
+                f"superseded by delivery {newest['delivery_id']}",
+                now,
+                issue,
+                newest["delivery_id"],
+                now,
+            ),
+        )
+        return newest
 
     def mark_event(self, delivery_id: str, state: EventState, *, error: str | None = None) -> None:
         with self._lock:

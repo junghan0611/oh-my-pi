@@ -232,7 +232,6 @@ def _build_extra_env(settings: Settings) -> dict[str, str]:
     strings for the sensitive keys is what actually masks them in the
     child — `del` on the parent's env would not help us here.
     """
-    del settings  # kept for future hooks (model-specific env, etc.)
     _stage_agent_home()
     _ensure_agent_run_dir()
     env = dict.fromkeys(_SCRUBBED_ENV_KEYS, "")
@@ -242,12 +241,22 @@ def _build_extra_env(settings: Settings) -> dict[str, str]:
     env["OMP_APP_NAME"] = "robomp"
     if _AGENT_HOME.is_dir():
         env["HOME"] = str(_AGENT_HOME)
+    if settings.agent_dir is not None:
+        # Share the host's agent dir (`agent.db`) with the child. Sandbox
+        # slots otherwise get an isolated XDG home with no provider
+        # credentials in it, and the child would come up unable to talk to
+        # any model.
+        env["PI_CODING_AGENT_DIR"] = str(settings.agent_dir)
     return env
 
 
 _TERMINAL_TRIAGE_TOOLS: frozenset[str] = frozenset({"gh_open_pr", "mark_unable_to_reproduce", "abort_task"})
 _TERMINAL_REVIEW_TOOLS: frozenset[str] = frozenset({"submit_pr_review", "abort_task"})
 _TERMINAL_RELEASE_TOOLS: frozenset[str] = frozenset({"release_retag", "abort_task"})
+# The label-only profile has no PR to open and no comment to post: a turn is
+# complete once it has recorded a verdict (`set_issue_labels`) or declined to
+# (`abort_task`).
+_TERMINAL_LABEL_TOOLS: frozenset[str] = frozenset({"set_issue_labels", "abort_task"})
 _PR_REQUIRING_CLASSIFICATIONS: frozenset[str] = frozenset({"bug", "documentation"})
 
 
@@ -266,6 +275,11 @@ def _needs_completion_reminder(
     """True iff a task turn ended before reaching its terminal tool."""
     if bindings.abort is not None and bindings.abort.triggered:
         return False
+    if inputs.settings.sorge_label_only:
+        # No classification gate here: a label-only turn owes a verdict on
+        # EVERY issue it is woken for, so anything that ends without touching
+        # the labels gets one nudge.
+        return not (tools_called & _TERMINAL_LABEL_TOOLS)
     if task_kind == "review_pr":
         return not (tools_called & _TERMINAL_REVIEW_TOOLS)
     if task_kind == "handle_release_ci":
@@ -341,7 +355,10 @@ def _drive_turn(
             task_kind=task_kind, inputs=inputs, bindings=bindings, tools_called=tools_called
         )
         if not needs_completion:
-            if task_kind == "review_pr":
+            # A label-only turn never commits: it has no push and no PR tool,
+            # so a dirty-worktree reminder could only ask for something the
+            # agent cannot do. Same for a submitted review.
+            if task_kind == "review_pr" or settings.sorge_label_only:
                 break
             dirty = _probe_workspace_dirty(inputs.workspace, inputs.slot_uid)
             if not dirty.is_dirty:
@@ -367,6 +384,13 @@ def _drive_turn(
             elif task_kind == "review_pr":
                 assert inputs.issue is not None
                 reminder = persona.review_completion_reminder(
+                    repo=inputs.repo,
+                    issue=inputs.issue,
+                    workspace=inputs.workspace,
+                )
+            elif settings.sorge_label_only:
+                assert inputs.issue is not None
+                reminder = persona.sorge_label_reminder(
                     repo=inputs.repo,
                     issue=inputs.issue,
                     workspace=inputs.workspace,
@@ -423,7 +447,7 @@ def _drive_turn(
                 "tools_called": sorted(tools_called),
             },
         )
-    if reminders_used and task_kind != "review_pr":
+    if reminders_used and task_kind != "review_pr" and not settings.sorge_label_only:
         final_dirty = _probe_workspace_dirty(inputs.workspace, inputs.slot_uid)
         if final_dirty.is_dirty:
             log.warning(
@@ -465,6 +489,11 @@ def _build_prompt(
     thread: tuple[ThreadMessage, ...] = (),
     resuming: bool = False,
 ) -> str:
+    if inputs.settings.sorge_label_only:
+        # Every turn of this profile is the same one-shot judgement, and it
+        # never resumes, so there is no follow-up/resume flavor to pick.
+        assert inputs.issue is not None
+        return persona.sorge_label_triage(repo=inputs.repo, issue=inputs.issue, workspace=inputs.workspace)
     if task_kind == "handle_release_ci":
         assert inputs.release is not None
         renderer = persona.followup_release if resuming else persona.kickoff_release
@@ -589,7 +618,12 @@ def _run_rpc_blocking(
     # Bare worktrees have no node_modules; install (idempotently) so the agent
     # can resolve workspace packages (@oh-my-pi/pi-*) and actually run tests.
     host_tools.ensure_workspace_dependencies(bindings)
-    resuming = _has_prior_session(bindings.workspace.session_dir)
+    prior_session = _has_prior_session(bindings.workspace.session_dir)
+    # A label-only turn judges the issue as it stands NOW. Resuming would
+    # carry the previous verdict's reasoning (and its todo state) into a new
+    # judgement, which is exactly the bias we do not want. The transcripts
+    # stay on disk as an audit trail; only the resume flag is dropped.
+    resuming = prior_session and not settings.sorge_label_only
     extra_args: tuple[str, ...] = ("--continue",) if resuming else ()
     log.info(
         "rpc_resume",
@@ -597,6 +631,8 @@ def _run_rpc_blocking(
             "issue": bindings.issue_key,
             "task": task_kind,
             "resuming": resuming,
+            "prior_session": prior_session,
+            "fresh_reason": "label-only profile" if prior_session and not resuming else None,
             "session_dir": str(bindings.workspace.session_dir),
             "attempts": inputs.attempts,
         },
@@ -618,7 +654,18 @@ def _run_rpc_blocking(
         },
     )
     inputs.db.set_event_model(inputs.delivery_id, chosen_model)
-    if task_kind == "handle_release_ci":
+    if settings.sorge_label_only:
+        # The stock system prompt mandates classify → comment → repro → PR,
+        # none of which this profile's toolset can do; it must be replaced,
+        # not augmented.
+        assert inputs.issue is not None
+        append_system_prompt = persona.system_append_sorge_label(
+            repo=inputs.repo,
+            issue=inputs.issue,
+            workspace=inputs.workspace,
+            bot_login=inputs.settings.bot_login,
+        )
+    elif task_kind == "handle_release_ci":
         assert inputs.release is not None
         append_system_prompt = persona.system_append_release(
             repo=inputs.repo,
@@ -693,7 +740,9 @@ def _run_rpc_blocking(
             client.on_tool_execution_end(_on_tool_end)
             client.on_message_update(_on_msg)
 
-            phases = persona.seed_phases(task_kind)
+            # A label-only turn is a single judgement; the stock triage phases
+            # (Reproduce / Fix / PR) describe work it must not do.
+            phases = [] if settings.sorge_label_only else persona.seed_phases(task_kind)
             if phases:
                 try:
                     if task_kind in ("triage_issue", "review_pr") and not resuming:

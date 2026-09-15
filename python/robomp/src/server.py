@@ -416,6 +416,8 @@ def create_app(settings: Settings | None = None, *, pool_factory: _PoolFactory =
             release_sentinel_enabled=cfg.release_sentinel_enabled,
             release_commit_prefix=cfg.release_commit_prefix,
             resolve_issue_from_pr=_resolve,
+            task_profile=cfg.task_profile,
+            self_logins=cfg.self_logins,
         )
 
         # Auto-close cancellation hooks. A pending question-issue closure is

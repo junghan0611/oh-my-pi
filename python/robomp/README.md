@@ -109,6 +109,36 @@ See `.env.example` for the authoritative variable list. The shipped
 `docker-compose.yml` uses per-service `environment:` allowlists rather
 than `env_file:`, so `GITHUB_TOKEN` only reaches the gh-proxy container.
 
+## Task profiles
+
+`ROBOMP_TASK_PROFILE` selects what a turn is allowed to be. `full` (default)
+is the bot described everywhere else in this document: triage, comment,
+reproduce, fix, PR.
+
+`sorge-label` narrows the deployment to a label steward, and the narrowing is
+total:
+
+- **Wake set**: `issues.opened|reopened|edited|labeled`. A label or body edit
+  re-opens the verdict. Every non-issue delivery — issue comments, PR review,
+  release CI — is dropped before it can queue; `issues.closed` still reclaims
+  the workspace.
+- **No self-wake**: a delivery whose `sender.login` is `ROBOMP_BOT_LOGIN` or
+  listed in `ROBOMP_SELF_LOGINS` never opens a turn, so the label a turn just
+  applied cannot wake the next one. Required when the PAT is a human account.
+- **One verdict per issue**: a queued backlog for the same issue collapses to
+  its newest delivery at claim time; superseded rows finish `skipped`.
+- **Fresh turn**: no `--continue`, no seeded phases. Prior transcripts stay on
+  disk for audit; the judgement starts from the issue as it stands.
+- **Toolset**: exactly `set_issue_labels`, `fetch_issue_thread`,
+  `gh_search_issues`, `abort_task`. Comment/push/PR/close/classify tools are
+  absent, not refused, and the turn ends on labels or `abort_task`. Within
+  this profile the single-value label axes (`state:`, `ball:`, `priority:`,
+  `brief:`) are exclusive: re-asserting one removes its previous value.
+
+`ROBOMP_AGENT_DIR` is independent of the profile: set it to an absolute host
+omp agent directory to share provider credentials with child omp processes
+that would otherwise start with an empty, isolated agent dir.
+
 ## Release sentinel
 
 `ROBOMP_RELEASE_SENTINEL_ENABLED=false` by default because this workflow may
